@@ -1,0 +1,22 @@
+[Unit]
+Description=Robinhood Claude Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/robinhood-agent/agent
+EnvironmentFile=/home/ubuntu/robinhood-agent/.env
+ExecStart=/home/ubuntu/robinhood-agent/venv/bin/python main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ubuntu/robinhood-agent/logs/agent.log
+StandardError=append:/home/ubuntu/robinhood-agent/logs/agent.log
+
+# Safety: restart max 5 times in 10 minutes, then give up
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

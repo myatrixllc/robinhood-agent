@@ -1,0 +1,8 @@
+.env
+.robinhood_token.json
+logs/
+__pycache__/
+*.pyc
+*.log
+venv/
+.DS_Store
