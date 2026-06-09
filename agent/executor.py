@@ -1,193 +1,285 @@
 """
-executor.py — Robinhood MCP trading executor
-Uses OAuth2 tokens (saved by auth.py). Auto-refreshes tokens silently.
-Currently supports stock orders (options coming soon from Robinhood).
+executor.py — Robinhood trading executor using robin_stocks
+Supports both stocks AND options trading.
+Works fully unattended on VM 24/7.
 """
 
 import os
 import json
-import time
 import logging
-import requests
-from pathlib import Path
-from datetime import datetime
+import robin_stocks.robinhood as rh
+from datetime import datetime, timedelta
 import pytz
 
 logger = logging.getLogger(__name__)
 ET     = pytz.timezone("America/New_York")
 
-# ── Token management ──────────────────────────────────────────────────────────
-TOKEN_FILE    = Path(__file__).parent.parent / ".robinhood_token.json"
-TOKEN_URL     = "https://api.robinhood.com/oauth2/token/"
-CLIENT_ID     = "robinhood-trading-mcp"
-MCP_BASE_URL  = "https://agent.robinhood.com/mcp/trading"
+# ── Login ─────────────────────────────────────────────────────────────────────
+_logged_in = False
+
+def login():
+    global _logged_in
+    if _logged_in:
+        return
+    username = os.environ.get("ROBINHOOD_USERNAME")
+    password = os.environ.get("ROBINHOOD_PASSWORD")
+    if not username or not password:
+        raise ValueError("ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD required in .env")
+    rh.login(
+        username=username,
+        password=password,
+        expiresIn=86400,      # 24 hours
+        store_session=True,   # saves session to disk, auto-renews
+        by_sms=True,          # MFA via SMS
+    )
+    _logged_in = True
+    logger.info("Logged into Robinhood successfully")
 
 
-def _load_token() -> dict:
-    if not TOKEN_FILE.exists():
-        raise FileNotFoundError(
-            "No Robinhood token found. Run: python agent/auth.py"
-        )
-    return json.loads(TOKEN_FILE.read_text())
-
-
-def _save_token(token_data: dict):
-    token_data["saved_at"] = time.time()
-    TOKEN_FILE.write_text(json.dumps(token_data, indent=2))
-    TOKEN_FILE.chmod(0o600)
-
-
-def _is_expired(token_data: dict, buffer_secs: int = 60) -> bool:
-    saved_at   = token_data.get("saved_at", 0)
-    expires_in = token_data.get("expires_in", 0)
-    return (time.time() - saved_at) >= (expires_in - buffer_secs)
-
-
-def _refresh_token(token_data: dict) -> dict:
-    logger.info("Refreshing Robinhood access token...")
-    resp = requests.post(TOKEN_URL, data={
-        "grant_type":    "refresh_token",
-        "refresh_token": token_data["refresh_token"],
-        "client_id":     CLIENT_ID,
-    }, timeout=15)
-    resp.raise_for_status()
-    new_token = resp.json()
-    if "refresh_token" not in new_token:
-        new_token["refresh_token"] = token_data["refresh_token"]
-    _save_token(new_token)
-    logger.info("Token refreshed successfully")
-    return new_token
-
-
-def _get_valid_token() -> str:
-    token_data = _load_token()
-    if _is_expired(token_data):
-        token_data = _refresh_token(token_data)
-    return token_data["access_token"]
-
-
-# ── MCP request helper ────────────────────────────────────────────────────────
-def _call(tool: str, params: dict) -> dict:
-    access_token = _get_valid_token()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-    }
-    payload = {"tool": tool, "parameters": params}
+def ensure_login():
+    """Call before every trade operation."""
     try:
-        resp = requests.post(
-            MCP_BASE_URL,
-            headers=headers,
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"MCP HTTP error [{tool}]: {e.response.status_code} — {e.response.text}")
-        return {"error": str(e), "status_code": e.response.status_code}
+        login()
     except Exception as e:
-        logger.error(f"MCP error [{tool}]: {e}")
-        return {"error": str(e)}
+        logger.error(f"Login failed: {e}")
+        raise
 
 
 # ── Account ───────────────────────────────────────────────────────────────────
-def get_account() -> dict:
-    return _call("get_account", {})
-
-
 def get_buying_power() -> float:
-    account = get_account()
-    return float(account.get("buying_power", 0))
+    ensure_login()
+    profile = rh.profiles.load_account_profile()
+    return float(profile.get("buying_power", 0))
 
 
-# ── Positions ─────────────────────────────────────────────────────────────────
+def get_account() -> dict:
+    ensure_login()
+    return rh.profiles.load_account_profile()
+
+
+# ── Quotes ────────────────────────────────────────────────────────────────────
+def get_quote(symbol: str) -> dict:
+    ensure_login()
+    quote = rh.stocks.get_latest_price(symbol)
+    return {"price": float(quote[0]) if quote else 0, "symbol": symbol}
+
+
+# ── Stock positions ───────────────────────────────────────────────────────────
 def get_positions() -> list:
-    result = _call("get_positions", {})
-    return result.get("positions", [])
+    ensure_login()
+    positions = rh.account.get_open_stock_positions()
+    result = []
+    for p in positions:
+        instrument = rh.stocks.get_instrument_by_url(p.get("instrument"))
+        symbol = instrument.get("symbol", "") if instrument else ""
+        result.append({
+            "symbol":            symbol,
+            "quantity":          float(p.get("quantity", 0)),
+            "average_buy_price": float(p.get("average_buy_price", 0)),
+            "id":                p.get("url"),
+        })
+    return result
+
+
+def get_option_positions() -> list:
+    ensure_login()
+    return rh.options.get_open_option_positions()
+
+
+def get_all_positions() -> list:
+    """Return both stock and option positions."""
+    stocks  = get_positions()
+    options = get_option_positions()
+    return stocks + options
 
 
 def get_open_position(symbol: str) -> dict | None:
-    positions = get_positions()
-    for p in positions:
-        if p.get("symbol") == symbol and float(p.get("quantity", 0)) > 0:
+    for p in get_positions():
+        if p.get("symbol") == symbol and p.get("quantity", 0) > 0:
             return p
     return None
 
 
-# ── Stock quotes ──────────────────────────────────────────────────────────────
-def get_quote(symbol: str) -> dict:
-    return _call("get_quote", {"symbol": symbol})
-
-
-# ── Stock orders (live now) ───────────────────────────────────────────────────
+# ── Stock orders ──────────────────────────────────────────────────────────────
 def place_stock_order(
     symbol:     str,
-    side:       str,
+    side:       str,      # 'buy' or 'sell'
     quantity:   float,
     order_type: str = "market",
 ) -> dict:
-    payload = {
-        "symbol":        symbol,
-        "side":          side,
-        "quantity":      quantity,
-        "order_type":    order_type,
-        "time_in_force": "gfd",
-    }
-    result = _call("place_order", payload)
-    logger.info(f"Stock order placed: {side} {quantity} {symbol} → {result}")
+    ensure_login()
+    if side == "buy":
+        result = rh.orders.order_buy_market(symbol, quantity)
+    else:
+        result = rh.orders.order_sell_market(symbol, quantity)
+    logger.info(f"Stock order: {side} {quantity} {symbol} → {result.get('id', 'N/A')}")
     return result
 
 
-def sell_position(symbol: str) -> dict:
+def sell_stock_position(symbol: str) -> dict:
     pos = get_open_position(symbol)
     if not pos:
-        logger.warning(f"No open position in {symbol} to sell")
-        return {"error": "No position found"}
-    qty = float(pos.get("quantity", 0))
-    return place_stock_order(symbol, "sell", qty)
+        return {"error": f"No open position in {symbol}"}
+    return place_stock_order(symbol, "sell", pos["quantity"])
 
 
-# ── Options orders (coming soon from Robinhood) ───────────────────────────────
+# ── Options orders ✅ ─────────────────────────────────────────────────────────
+def get_options_chain(symbol: str, expiry: str, option_type: str) -> list:
+    """
+    Get options chain for a symbol.
+    option_type: 'call' or 'put'
+    expiry: 'YYYY-MM-DD'
+    """
+    ensure_login()
+    try:
+        chain = rh.options.get_options_chain(symbol)
+        contracts = rh.options.find_options_by_expiration(
+            symbol,
+            expirationDate=expiry,
+            optionType=option_type,
+        )
+        return contracts or []
+    except Exception as e:
+        logger.warning(f"Options chain error: {e}")
+        return []
+
+
+def find_otm_strike(symbol: str, option_type: str, expiry: str) -> float | None:
+    """Find the first OTM strike for a given symbol and option type."""
+    ensure_login()
+    try:
+        quote       = get_quote(symbol)
+        price       = quote["price"]
+        contracts   = rh.options.find_options_by_expiration(
+            symbol,
+            expirationDate=expiry,
+            optionType=option_type,
+        )
+        if not contracts:
+            return None
+        strikes = sorted([float(c["strike_price"]) for c in contracts])
+        if option_type == "call":
+            # First strike above current price
+            otm = [s for s in strikes if s > price]
+            return otm[0] if otm else None
+        else:
+            # First strike below current price
+            otm = [s for s in strikes if s < price]
+            return otm[-1] if otm else None
+    except Exception as e:
+        logger.warning(f"Strike finder error: {e}")
+        return None
+
+
 def place_option_order(
     symbol:      str,
-    option_type: str,
+    option_type: str,    # 'call' or 'put'
     strike:      float,
-    expiry:      str,
+    expiry:      str,    # 'YYYY-MM-DD'
     contracts:   int = 1,
 ) -> dict:
-    payload = {
-        "symbol":          symbol,
-        "option_type":     option_type,
-        "strike":          strike,
-        "expiration":      expiry,
-        "quantity":        contracts,
-        "side":            "buy",
-        "position_effect": "open",
-        "order_type":      "market",
-    }
-    result = _call("place_option_order", payload)
-    if result.get("error"):
-        logger.warning(f"Options not yet supported by Robinhood MCP: {result}")
-    return result
+    """
+    Buy to open an options contract.
+    Uses limit order at mark price for better fills.
+    """
+    ensure_login()
+    try:
+        # Get mark price for limit order
+        options = rh.options.find_options_by_expiration_and_strike(
+            symbol,
+            expirationDate=expiry,
+            strikePrice=str(strike),
+            optionType=option_type,
+        )
+        if options:
+            mark = float(options[0].get("mark_price", 0))
+            limit_price = round(mark * 1.02, 2)  # 2% above mark for quick fill
+        else:
+            limit_price = None
+
+        if limit_price:
+            result = rh.orders.order_buy_option_limit(
+                positionEffect="open",
+                creditOrDebit="debit",
+                price=limit_price,
+                symbol=symbol,
+                quantity=contracts,
+                expirationDate=expiry,
+                strike=strike,
+                optionType=option_type,
+            )
+        else:
+            result = rh.orders.order_buy_option_market(
+                positionEffect="open",
+                symbol=symbol,
+                quantity=contracts,
+                expirationDate=expiry,
+                strike=strike,
+                optionType=option_type,
+            )
+
+        logger.info(f"Option order placed: {option_type} {symbol} ${strike} {expiry} → {result.get('id', 'N/A')}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Option order failed: {e}")
+        return {"error": str(e)}
+
+
+def close_option_position(position: dict) -> dict:
+    """Sell to close an open option position."""
+    ensure_login()
+    try:
+        result = rh.orders.order_sell_option_market(
+            positionEffect="close",
+            symbol=position.get("chain_symbol"),
+            quantity=int(float(position.get("quantity", 1))),
+            expirationDate=position.get("expiration_date"),
+            strike=float(position.get("strike_price", 0)),
+            optionType=position.get("option_type"),
+        )
+        logger.info(f"Option closed: {result.get('id', 'N/A')}")
+        return result
+    except Exception as e:
+        logger.error(f"Close option failed: {e}")
+        return {"error": str(e)}
 
 
 # ── P&L tracking ─────────────────────────────────────────────────────────────
 def enrich_position_pnl(position: dict) -> dict:
+    """Add pnl_pct to position."""
     try:
-        symbol        = position.get("symbol")
-        quote         = get_quote(symbol)
-        current_price = float(quote.get("last_trade_price") or quote.get("price", 0))
-        avg_cost      = float(position.get("average_buy_price", 0))
-        if avg_cost > 0:
-            pnl_pct = ((current_price - avg_cost) / avg_cost) * 100
+        symbol = position.get("symbol") or position.get("chain_symbol")
+        if not symbol:
+            return position
+
+        # Options position
+        if position.get("option_type"):
+            option_data = rh.options.find_options_by_expiration_and_strike(
+                symbol,
+                expirationDate=position.get("expiration_date"),
+                strikePrice=str(position.get("strike_price")),
+                optionType=position.get("option_type"),
+            )
+            if option_data:
+                current = float(option_data[0].get("mark_price", 0))
+                entry   = float(position.get("average_price", current))
+        else:
+            # Stock position
+            quote   = get_quote(symbol)
+            current = quote["price"]
+            entry   = float(position.get("average_buy_price", current))
+
+        if entry > 0:
+            pnl_pct = ((current - entry) / entry) * 100
             position["pnl_pct"]       = round(pnl_pct, 2)
-            position["current_price"] = current_price
-            position["entry_price"]   = avg_cost
+            position["current_price"] = current
+            position["entry_price"]   = entry
+
     except Exception as e:
-        logger.warning(f"P&L compute error: {e}")
+        logger.warning(f"P&L error: {e}")
         position["pnl_pct"] = 0
+
     return position
 
 
