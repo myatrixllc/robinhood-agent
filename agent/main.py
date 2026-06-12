@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv("/home/ubuntu/robinhood-agent/.env")
+
 """
 main.py — Main trading agent loop
 Runs continuously during market hours, scanning and trading AAPL + MCD
@@ -7,13 +10,15 @@ import time
 import logging
 import json
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pytz
 
 from scanner  import get_signal, is_market_open
+from expiry   import get_best_expiry
+from streamer import start_stream, set_scan_callback
 from brain    import decide, should_exit
 from executor import (
-    get_positions, place_option_order, close_position,
+    get_positions, place_option_order, close_option_position,
     enrich_position_pnl, daily_loss_limit_hit, record_loss, get_options_chain
 )
 from notifier import (
@@ -35,7 +40,7 @@ logger = logging.getLogger("main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SYMBOLS         = ["AAPL", "MCD"]
-SCAN_INTERVAL   = 60 * 2      # check every 2 minutes
+SCAN_INTERVAL   = 30      # check every 2 minutes
 DAILY_LOSS_CAP  = float(os.environ.get("DAILY_LOSS_CAP", "200"))
 ET              = pytz.timezone("America/New_York")
 
@@ -62,7 +67,7 @@ def run_scan_cycle():
         exit_now, reason = should_exit(pos)
         if exit_now:
             logger.info(f"Exiting position: {pos.get('symbol')} — {reason}")
-            result = close_position(pos.get("id") or pos.get("position_id"))
+            result = close_option_position(pos.get("id") or pos.get("position_id"))
             if "error" not in result:
                 pnl = pos.get("pnl_pct", 0)
                 if pnl < 0:
@@ -89,7 +94,7 @@ def run_scan_cycle():
         option_type = "call" if signal["signal"] == "BUY_CALL" else "put"
         try:
             from datetime import timedelta
-            expiry = (datetime.now(ET) + timedelta(days=14)).strftime("%Y-%m-%d")
+            expiry = get_best_expiry(symbol)
             chain = get_options_chain(symbol, option_type, expiry)
         except Exception:
             chain = None
@@ -139,6 +144,8 @@ def maybe_send_daily_summary():
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
     logger.info("🤖 Trading agent started")
+    set_scan_callback(lambda symbol: run_scan_cycle())
+    start_stream()
     logger.info(f"   Symbols: {SYMBOLS}")
     logger.info(f"   Daily loss cap: ${DAILY_LOSS_CAP}")
     logger.info(f"   Scan interval: {SCAN_INTERVAL}s")

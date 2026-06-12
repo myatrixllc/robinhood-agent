@@ -30,7 +30,7 @@ def login():
         password=password,
         expiresIn=86400,      # 24 hours
         store_session=True,   # saves session to disk, auto-renews
-        by_sms=True,          # MFA via SMS
+
     )
     _logged_in = True
     logger.info("Logged into Robinhood successfully")
