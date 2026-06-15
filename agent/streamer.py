@@ -1,12 +1,11 @@
 """
-streamer.py — Real-time Alpaca WebSocket price streamer
-Uses async handler as required by alpaca-py
+streamer.py — Real-time Alpaca WebSocket
+Triggers scan on EVERY 1-minute bar — true real-time
 """
 
 import os
 import logging
 import threading
-import asyncio
 from datetime import datetime
 import pytz
 from alpaca.data.live import StockDataStream
@@ -15,7 +14,7 @@ logger = logging.getLogger(__name__)
 ET     = pytz.timezone("America/New_York")
 
 SYMBOLS        = ["AAPL", "MCD"]
-PRICE_MOVE_PCT = 0.3
+PRICE_MOVE_PCT = 0.15
 
 _last_prices   = {}
 _scan_callback = None
@@ -36,16 +35,15 @@ async def _on_bar(bar):
         if not is_market_open():
             return
 
+        logger.info(f"📊 {symbol} bar: ${price}")
+        if _scan_callback:
+            threading.Thread(target=_scan_callback, daemon=True).start()
+
         if symbol in _last_prices:
             last = _last_prices[symbol]
             move = abs(price - last) / last * 100
             if move >= PRICE_MOVE_PCT:
-                logger.info(f"⚡ {symbol} moved {move:.2f}% → ${price} — triggering scan")
-                if _scan_callback:
-                    threading.Thread(
-                        target=_scan_callback,
-                        daemon=True
-                    ).start()
+                logger.info(f"⚡ {symbol} moved {move:.2f}% → ${price}")
 
         _last_prices[symbol] = price
 

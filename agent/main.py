@@ -1,32 +1,33 @@
+"""
+main.py — Professional scalping agent
+Entry loop: every 30s
+Exit loop: every 10s (fast monitoring)
+"""
+
 from dotenv import load_dotenv
 load_dotenv("/home/ubuntu/robinhood-agent/.env")
 
-"""
-main.py — Main trading agent loop
-Runs continuously during market hours, scanning and trading AAPL + MCD
-"""
-
 import time
 import logging
-import json
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import pytz
 
-from scanner  import get_signal, is_market_open
-from expiry   import get_best_expiry
-from streamer import start_stream, set_scan_callback
+from scanner  import get_signal, is_market_open, should_exit_position, get_time_session
 from brain    import decide, should_exit
 from executor import (
-    get_positions, place_option_order, close_option_position,
-    enrich_position_pnl, daily_loss_limit_hit, record_loss, get_options_chain
+    login, get_option_positions, place_option_order,
+    close_option_position, enrich_position_pnl,
+    daily_loss_limit_hit, record_loss, find_otm_strike
 )
+from expiry   import get_best_expiry
+from streamer import start_stream, set_scan_callback
 from notifier import (
     alert_trade_placed, alert_position_closed,
     alert_daily_summary, alert_error, alert_daily_loss_limit
 )
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -39,48 +40,78 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SYMBOLS         = ["AAPL", "MCD"]
-SCAN_INTERVAL   = 30      # check every 2 minutes
-DAILY_LOSS_CAP  = float(os.environ.get("DAILY_LOSS_CAP", "200"))
-ET              = pytz.timezone("America/New_York")
+SYMBOLS        = ["AAPL", "MCD"]
+SCAN_INTERVAL  = 30
+EXIT_INTERVAL  = 5
+DAILY_LOSS_CAP = float(os.environ.get("DAILY_LOSS_CAP", "200"))
+ET             = pytz.timezone("America/New_York")
 
-# In-memory trade log for daily summary
-daily_trades: list[dict] = []
+_open_scalp: dict | None = None
+daily_trades: list       = []
 last_summary_date: str   = ""
 
 
-def run_scan_cycle():
-    """One full scan cycle — check signals for all symbols and act."""
-
-    # Daily loss guard
-    if daily_loss_limit_hit(DAILY_LOSS_CAP):
-        logger.warning(f"Daily loss cap ${DAILY_LOSS_CAP} hit — skipping cycle")
+def monitor_exit():
+    global _open_scalp
+    if not _open_scalp:
         return
 
-    # Get current open positions (max 1 rule enforced by Claude + here)
-    open_positions = get_positions()
-    open_symbols   = {p.get("symbol") for p in open_positions}
+    symbol      = _open_scalp.get("symbol")
+    option_type = _open_scalp.get("option_type")
+    entry_time  = _open_scalp.get("entry_time")
+    elapsed     = (datetime.now(ET) - entry_time).seconds
+    _open_scalp["elapsed_seconds"] = elapsed
 
-    # ── Check exit conditions on open positions ───────────────────────────────
-    for pos in open_positions:
-        pos = enrich_position_pnl(pos)
-        exit_now, reason = should_exit(pos)
-        if exit_now:
-            logger.info(f"Exiting position: {pos.get('symbol')} — {reason}")
-            result = close_option_position(pos.get("id") or pos.get("position_id"))
-            if "error" not in result:
-                pnl = pos.get("pnl_pct", 0)
-                if pnl < 0:
-                    record_loss(abs(pnl))
-                alert_position_closed(pos, reason)
-                daily_trades.append({**pos, "exit_reason": reason})
-                open_symbols.discard(pos.get("symbol"))
-            else:
-                alert_error("Close position failed", str(result))
+    positions = get_option_positions()
+    for pos in positions:
+        if pos.get("chain_symbol") == symbol:
+            pos = enrich_position_pnl(pos)
+            _open_scalp["pnl_pct"] = pos.get("pnl_pct", 0)
+            exit_now, reason = should_exit(_open_scalp)
+            if exit_now:
+                _close_position(pos, reason)
+                return
 
-    # ── Scan for new entries ──────────────────────────────────────────────────
-    if len(open_symbols) >= 1:
-        logger.info(f"Already have open position(s): {open_symbols} — no new entries")
+    exit_now, reason = should_exit_position(
+        symbol, _open_scalp.get("entry_price", 0),
+        entry_time, option_type
+    )
+    if exit_now:
+        positions = get_option_positions()
+        for pos in positions:
+            if pos.get("chain_symbol") == symbol:
+                _close_position(pos, reason)
+                return
+
+
+def _close_position(pos: dict, reason: str):
+    global _open_scalp
+    result = close_option_position(pos)
+    if "error" not in result:
+        pnl = pos.get("pnl_pct", 0)
+        if pnl < 0:
+            record_loss(abs(pnl))
+        alert_position_closed(pos, reason)
+        daily_trades.append({**pos, "exit_reason": reason, "pnl_pct": pnl})
+        logger.info(f"Position closed: {reason} | P&L: {pnl:+.1f}%")
+        _open_scalp = None
+    else:
+        logger.error(f"Close failed: {result}")
+
+
+def run_scan_cycle():
+    global _open_scalp
+
+    if daily_loss_limit_hit(DAILY_LOSS_CAP):
+        logger.warning(f"Daily loss cap ${DAILY_LOSS_CAP} hit — no new trades")
+        return
+
+    if _open_scalp:
+        return
+
+    session = get_time_session()
+    if session == "LUNCH":
+        logger.debug("Lunch hour — skipping")
         return
 
     for symbol in SYMBOLS:
@@ -90,83 +121,89 @@ def run_scan_cycle():
         if signal.get("signal") not in ("BUY_CALL", "BUY_PUT"):
             continue
 
-        # Fetch options chain to give Claude real strikes
         option_type = "call" if signal["signal"] == "BUY_CALL" else "put"
-        try:
-            from datetime import timedelta
-            expiry = get_best_expiry(symbol)
-            chain = get_options_chain(symbol, option_type, expiry)
-        except Exception:
-            chain = None
-            expiry = None
-
-        # Ask Claude
-        open_pos = open_positions[0] if open_positions else None
-        decision = decide(signal, open_pos, chain)
-        logger.info(f"Decision [{symbol}]: {decision}")
-
-        if decision.get("action") == "HOLD":
-            logger.info(f"Claude says HOLD — {decision.get('reason')}")
+        expiry      = get_best_expiry(symbol, days_out=5)
+        if not expiry:
+            logger.warning(f"No expiry for {symbol}")
             continue
 
-        # Place the order
+        strike = find_otm_strike(symbol, option_type, expiry)
+        if not strike:
+            logger.warning(f"No strike for {symbol}")
+            continue
+
+        decision = decide(signal, _open_scalp)
+        if decision.get("action") == "HOLD":
+            logger.info(f"Claude HOLD — {decision.get('reason')}")
+            continue
+
         order = place_option_order(
-            symbol     = decision["symbol"],
-            option_type= "call" if decision["action"] == "BUY_CALL" else "put",
-            strike     = decision["strike"],
-            expiry     = decision.get("expiry", expiry),
-            contracts  = 1,
+            symbol=symbol,
+            option_type=option_type,
+            strike=strike,
+            expiry=expiry,
+            contracts=1,
         )
 
         if "error" in order:
-            alert_error(f"Order failed for {symbol}", str(order))
+            alert_error(f"Order failed {symbol}", str(order))
         else:
+            _open_scalp = {
+                "symbol":      symbol,
+                "option_type": option_type,
+                "strike":      strike,
+                "expiry":      expiry,
+                "entry_time":  datetime.now(ET),
+                "entry_price": signal.get("price"),
+                "pnl_pct":     0,
+            }
             alert_trade_placed(decision, order)
-            daily_trades.append({**decision, "order_id": order.get("id")})
-            break  # max 1 position — stop scanning after placing
+            logger.info(f"🎯 Scalp entered: {symbol} {option_type} ${strike} exp {expiry}")
+            break
 
 
 def maybe_send_daily_summary():
-    """Send a daily P&L summary at market close."""
     global last_summary_date
     now_et = datetime.now(ET)
     today  = now_et.date().isoformat()
-
-    # Send once after 4pm ET
     if now_et.hour >= 16 and last_summary_date != today:
         total_pnl = sum(t.get("pnl_pct", 0) for t in daily_trades)
         alert_daily_summary(daily_trades, total_pnl)
         daily_trades.clear()
         last_summary_date = today
-        logger.info("Daily summary sent")
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    logger.info("🤖 Trading agent started")
-    set_scan_callback(lambda symbol: run_scan_cycle())
-    start_stream()
-    logger.info(f"   Symbols: {SYMBOLS}")
+    logger.info("🤖 Scalping agent started")
+    logger.info(f"   Symbols:        {SYMBOLS}")
     logger.info(f"   Daily loss cap: ${DAILY_LOSS_CAP}")
-    logger.info(f"   Scan interval: {SCAN_INTERVAL}s")
+    logger.info(f"   Scan interval:  {SCAN_INTERVAL}s")
+    logger.info(f"   Exit interval:  {EXIT_INTERVAL}s")
+
+    login()
+    set_scan_callback(run_scan_cycle)
+    start_stream()
+
+    last_scan = 0
 
     while True:
         try:
+            now = time.time()
             if is_market_open():
-                run_scan_cycle()
+                monitor_exit()
+                if now - last_scan >= SCAN_INTERVAL:
+                    run_scan_cycle()
+                    last_scan = now
             else:
                 logger.debug("Market closed — sleeping")
-
             maybe_send_daily_summary()
-
         except KeyboardInterrupt:
-            logger.info("Agent stopped by user")
+            logger.info("Agent stopped")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            alert_error("Main loop error", str(e))
-
-        time.sleep(SCAN_INTERVAL)
+            logger.error(f"Main loop error: {e}", exc_info=True)
+            alert_error("Main loop", str(e))
+        time.sleep(EXIT_INTERVAL)
 
 
 if __name__ == "__main__":
