@@ -1,7 +1,7 @@
 """
-main.py — Professional scalping agent
-Entry loop: every 30s
-Exit loop: every 10s (fast monitoring)
+main.py — Professional scalping agent with market sentiment
+Entry loop: every 30s + WebSocket real-time
+Exit loop: every 5s
 """
 
 from dotenv import load_dotenv
@@ -13,16 +13,17 @@ import os
 from datetime import datetime, date
 import pytz
 
-from scanner  import get_signal, is_market_open, should_exit_position, get_time_session
-from brain    import decide, should_exit
-from executor import (
+from scanner   import get_signal, is_market_open, should_exit_position, get_time_session
+from brain     import decide, should_exit
+from sentiment import get_market_sentiment
+from executor  import (
     login, get_option_positions, place_option_order,
     close_option_position, enrich_position_pnl,
     daily_loss_limit_hit, record_loss, find_otm_strike
 )
-from expiry   import get_best_expiry
-from streamer import start_stream, set_scan_callback
-from notifier import (
+from expiry    import get_best_expiry
+from streamer  import start_stream, set_scan_callback
+from notifier  import (
     alert_trade_placed, alert_position_closed,
     alert_daily_summary, alert_error, alert_daily_loss_limit
 )
@@ -115,14 +116,38 @@ def run_scan_cycle():
         return
 
     for symbol in SYMBOLS:
+        # ── Step 1: Market sentiment check ────────────────────────────────
+        sentiment = get_market_sentiment(symbol)
+        if not sentiment["safe"]:
+            logger.info(f"🚫 Sentiment block [{symbol}]: {sentiment['reason']}")
+            continue
+
+        spy_trend = sentiment["spy"]["trend"]
+        vix_level = sentiment["vix"]["level"]
+        logger.info(f"✅ Sentiment OK [{symbol}]: SPY={spy_trend} VIX={vix_level}")
+
+        # ── Step 2: Technical signal ───────────────────────────────────────
         signal = get_signal(symbol)
         logger.info(f"Signal [{symbol}]: {signal.get('signal')} — {signal.get('reason')}")
 
         if signal.get("signal") not in ("BUY_CALL", "BUY_PUT"):
             continue
 
+        # ── Step 3: Align signal with market direction ─────────────────────
         option_type = "call" if signal["signal"] == "BUY_CALL" else "put"
-        expiry      = get_best_expiry(symbol, days_out=5)
+
+        # Don't buy calls in strong downtrend
+        if option_type == "call" and spy_trend == "STRONG_DOWN":
+            logger.info(f"⚠️ Skipping CALL — market in STRONG_DOWN")
+            continue
+
+        # Don't buy puts in strong uptrend
+        if option_type == "put" and spy_trend == "STRONG_UP":
+            logger.info(f"⚠️ Skipping PUT — market in STRONG_UP")
+            continue
+
+        # ── Step 4: Get expiry + strike ────────────────────────────────────
+        expiry = get_best_expiry(symbol, days_out=5)
         if not expiry:
             logger.warning(f"No expiry for {symbol}")
             continue
@@ -132,11 +157,15 @@ def run_scan_cycle():
             logger.warning(f"No strike for {symbol}")
             continue
 
+        # ── Step 5: Ask Claude with full context ───────────────────────────
+        signal["sentiment"] = sentiment
         decision = decide(signal, _open_scalp)
+
         if decision.get("action") == "HOLD":
             logger.info(f"Claude HOLD — {decision.get('reason')}")
             continue
 
+        # ── Step 6: Place order ────────────────────────────────────────────
         order = place_option_order(
             symbol=symbol,
             option_type=option_type,
