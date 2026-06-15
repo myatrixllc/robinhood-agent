@@ -1,36 +1,23 @@
 """
-scanner.py — Professional scalping scanner
-Uses 1-min bars for price velocity, VWAP, RSI, volume confirmation
+scanner.py — 0DTE Scalping Scanner
+Matches manual strategy: ITM options, same-day expiry, $1-2 moves
 """
 
-import os
 import pandas as pd
-import numpy as np
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 import pytz
 import logging
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
-ET = pytz.timezone("America/New_York")
+ET     = pytz.timezone("America/New_York")
 
 MARKET_OPEN  = time(9, 35)
 MARKET_CLOSE = time(15, 45)
-LUNCH_START  = time(11, 30)
-LUNCH_END    = time(13, 0)
 
-_client = None
-
-def get_client():
-    global _client
-    if _client is None:
-        _client = StockHistoricalDataClient(
-            api_key=os.environ.get("ALPACA_API_KEY"),
-            secret_key=os.environ.get("ALPACA_SECRET_KEY"),
-        )
-    return _client
+# Tuned to match your manual strategy
+MOMENTUM_THRESHOLD = 1.0   # $1 move triggers signal
+MIN_VOLUME_RATIO   = 0.5   # relaxed volume requirement
 
 
 def is_market_open() -> bool:
@@ -44,7 +31,7 @@ def get_time_session() -> str:
     now = datetime.now(ET).time()
     if time(9, 35) <= now <= time(10, 30):
         return "PRIME"
-    elif LUNCH_START <= now <= LUNCH_END:
+    elif time(11, 30) <= now <= time(13, 0):
         return "LUNCH"
     elif time(13, 0) <= now <= time(15, 45):
         return "AFTERNOON"
@@ -52,6 +39,8 @@ def get_time_session() -> str:
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
+    if len(series) < period + 1:
+        return 50.0
     delta    = series.diff()
     gain     = delta.clip(lower=0)
     loss     = -delta.clip(upper=0)
@@ -62,97 +51,116 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
     return round(float(rsi.iloc[-1]), 2)
 
 
-def compute_vwap(bars: pd.DataFrame) -> float:
-    typical_price = (bars["high"] + bars["low"] + bars["close"]) / 3
-    vwap = (typical_price * bars["volume"]).cumsum() / bars["volume"].cumsum()
-    return round(float(vwap.iloc[-1]), 2)
-
-
-def compute_price_velocity(bars: pd.DataFrame, lookback: int = 2) -> dict:
-    if len(bars) < lookback + 1:
-        return {"move": 0, "direction": "FLAT", "magnitude": 0}
-    price_now = float(bars["close"].iloc[-1])
-    price_ago = float(bars["close"].iloc[-lookback - 1])
-    move      = price_now - price_ago
-    move_pct  = (move / price_ago) * 100
-    direction = "UP" if move > 0 else "DOWN" if move < 0 else "FLAT"
-    return {
-        "move":      round(move, 2),
-        "move_pct":  round(move_pct, 3),
-        "direction": direction,
-        "magnitude": abs(round(move, 2)),
-    }
-
-
 def get_signal(symbol: str) -> dict:
     try:
-        client  = get_client()
         session = get_time_session()
 
+        # Skip lunch — low volume choppy
         if session == "LUNCH":
-            return {"symbol": symbol, "signal": "SKIP", "reason": "Lunch hour — avoid", "session": session}
+            return {
+                "symbol":  symbol,
+                "signal":  "SKIP",
+                "reason":  "Lunch hour — avoid",
+                "session": session,
+            }
 
-        start   = datetime.now(ET).replace(hour=9, minute=30, second=0)
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-        )
-        bars = client.get_stock_bars(request).df
+        # Get 1-min bars
+        ticker = yf.Ticker(symbol)
+        bars   = ticker.history(period="1d", interval="1m")
 
-        if bars.empty or len(bars) < 5:
+        if bars.empty or len(bars) < 6:
             return {"symbol": symbol, "signal": "NO_DATA", "reason": "Not enough bars"}
 
-        if isinstance(bars.index, pd.MultiIndex):
-            bars = bars.xs(symbol, level="symbol")
+        # Use second-to-last bar (last is incomplete)
+        current_price  = round(float(bars["Close"].iloc[-2]), 2)
+        open_price     = round(float(bars["Open"].iloc[0]), 2)
+        price_5min     = round(float(bars["Close"].iloc[-7]), 2) if len(bars) >= 7 else open_price
+        price_2min     = round(float(bars["Close"].iloc[-3]), 2)
+        price_1min     = round(float(bars["Close"].iloc[-2]), 2)
 
-        current_price  = round(float(bars["close"].iloc[-1]), 2)
-        current_volume = float(bars["volume"].iloc[-1])
-        avg_volume     = float(bars["volume"].mean())
-        volume_ratio   = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1.0
-        rsi            = compute_rsi(bars["close"])
-        vwap           = compute_vwap(bars)
-        velocity       = compute_price_velocity(bars, lookback=2)
-        vwap_dev       = round(current_price - vwap, 2)
+        # Volume (use completed bars only)
+        current_vol    = float(bars["Volume"].iloc[-2])
+        avg_vol        = float(bars["Volume"].iloc[:-2].mean())
+        vol_ratio      = round(current_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+        # Moves
+        move_5min      = round(current_price - price_5min, 2)
+        move_2min      = round(current_price - price_2min, 2)
+        move_from_open = round(current_price - open_price, 2)
+
+        # RSI
+        rsi = compute_rsi(bars["Close"].iloc[:-1])
+
+        # Day high/low
+        day_high = round(float(bars["High"].iloc[:-1].max()), 2)
+        day_low  = round(float(bars["Low"].iloc[:-1].min()), 2)
+
+        # Distance from open — good for context
+        open_pct = round((move_from_open / open_price) * 100, 2)
 
         signal = "HOLD"
-        reason = f"Price=${current_price} VWAP=${vwap} RSI={rsi} Vol={volume_ratio}x Move=${velocity['move']}"
+        reason = (
+            f"Price=${current_price} Open=${open_price}({open_pct:+.1f}%) "
+            f"5min=${move_5min:+.2f} 2min=${move_2min:+.2f} "
+            f"Vol={vol_ratio}x RSI={rsi}"
+        )
 
+        # ── BUY CALL conditions ───────────────────────────────────────────
+        # Price dropped $1+ → bounce expected (like your PUT→CALL trade)
+        # OR price popping strongly → momentum continuation
         if (
-            velocity["direction"] == "DOWN" and
-            velocity["magnitude"] >= 2.0 and
-            vwap_dev < 0 and
-            volume_ratio >= 0.8 and
-            rsi < 55
+            move_5min <= -MOMENTUM_THRESHOLD and   # dropped $1+ in 5 min
+            move_2min <= -0.5 and                  # still dropping
+            vol_ratio >= MIN_VOLUME_RATIO and
+            rsi < 60 and
+            current_price > day_low + 0.5          # not at absolute low
         ):
             signal = "BUY_CALL"
-            reason = f"⚡ DROP ${velocity['magnitude']} in 2min | Below VWAP ${vwap_dev} | RSI={rsi} | Vol={volume_ratio}x"
+            reason = (
+                f"📉→📈 DROP ${move_5min:.2f} in 5min | "
+                f"Bounce setup | RSI={rsi} | Vol={vol_ratio}x"
+            )
 
+        # ── BUY PUT conditions ────────────────────────────────────────────
+        # Price popped $1+ → pullback expected (like your trade)
         elif (
-            velocity["direction"] == "UP" and
-            velocity["magnitude"] >= 2.0 and
-            vwap_dev > 0 and
-            volume_ratio >= 0.8 and
-            rsi > 45
+            move_5min >= MOMENTUM_THRESHOLD and    # popped $1+ in 5 min
+            move_2min >= 0.5 and                   # still rising
+            vol_ratio >= MIN_VOLUME_RATIO and
+            rsi > 40 and
+            current_price < day_high - 0.5         # not at absolute high
         ):
             signal = "BUY_PUT"
-            reason = f"⚡ POP ${velocity['magnitude']} in 2min | Above VWAP ${vwap_dev} | RSI={rsi} | Vol={volume_ratio}x"
+            reason = (
+                f"📈→📉 POP ${move_5min:+.2f} in 5min | "
+                f"Pullback setup | RSI={rsi} | Vol={vol_ratio}x"
+            )
 
-        if signal != "HOLD" and session == "PRIME":
-            reason += " | 🔥 PRIME SESSION"
+        # ── PRIME session — lower threshold ──────────────────────────────
+        if signal == "HOLD" and session == "PRIME":
+            if move_5min <= -0.75 and move_2min < 0 and vol_ratio >= 0.5:
+                signal = "BUY_CALL"
+                reason = f"🔥 PRIME DROP ${move_5min:.2f} | RSI={rsi} | Vol={vol_ratio}x"
+            elif move_5min >= 0.75 and move_2min > 0 and vol_ratio >= 0.5:
+                signal = "BUY_PUT"
+                reason = f"🔥 PRIME POP ${move_5min:+.2f} | RSI={rsi} | Vol={vol_ratio}x"
 
         return {
-            "symbol":       symbol,
-            "price":        current_price,
-            "vwap":         vwap,
-            "vwap_dev":     vwap_dev,
-            "rsi":          rsi,
-            "volume_ratio": volume_ratio,
-            "velocity":     velocity,
-            "session":      session,
-            "signal":       signal,
-            "reason":       reason,
-            "timestamp":    datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+            "symbol":         symbol,
+            "price":          current_price,
+            "open_price":     open_price,
+            "move_5min":      move_5min,
+            "move_2min":      move_2min,
+            "move_from_open": move_from_open,
+            "open_pct":       open_pct,
+            "day_high":       day_high,
+            "day_low":        day_low,
+            "volume_ratio":   vol_ratio,
+            "rsi":            rsi,
+            "session":        session,
+            "signal":         signal,
+            "reason":         reason,
+            "timestamp":      datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
         }
 
     except Exception as e:
@@ -162,35 +170,34 @@ def get_signal(symbol: str) -> dict:
 
 def should_exit_position(symbol: str, entry_price: float, entry_time: datetime, option_type: str) -> tuple[bool, str]:
     try:
-        client  = get_client()
-        start   = datetime.now(ET) - timedelta(minutes=5)
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-        )
-        bars = client.get_stock_bars(request).df
+        ticker = yf.Ticker(symbol)
+        bars   = ticker.history(period="1d", interval="1m")
 
-        if bars.empty:
+        if bars.empty or len(bars) < 3:
             return False, ""
 
-        if isinstance(bars.index, pd.MultiIndex):
-            bars = bars.xs(symbol, level="symbol")
+        current_price = float(bars["Close"].iloc[-2])
+        prev_price    = float(bars["Close"].iloc[-3])
+        move_1min     = current_price - prev_price
+        elapsed       = (datetime.now(ET) - entry_time).seconds
 
-        velocity = compute_price_velocity(bars, lookback=1)
-        elapsed  = (datetime.now(ET) - entry_time).seconds
+        # 0DTE — max hold 5 min (not 10)
+        if elapsed >= 300:
+            return True, "⏰ Max 5 min hold — 0DTE exit"
 
-        if elapsed >= 600:
-            return True, f"⏰ Max 10 min hold reached"
+        # Exit call when momentum reverses
+        if option_type == "call":
+            if move_1min < -0.5 and elapsed > 60:
+                return True, f"📉 Call momentum reversed — exit"
+            if move_1min < 0 and elapsed > 180:
+                return True, f"⚠️ Call stalling 3 min — exit"
 
-        if option_type == "call" and velocity["direction"] == "UP" and elapsed > 60:
-            return True, f"✅ Momentum reversed UP — take profit"
-
-        if option_type == "put" and velocity["direction"] == "DOWN" and elapsed > 60:
-            return True, f"✅ Momentum reversed DOWN — take profit"
-
-        if velocity["magnitude"] < 0.3 and elapsed > 120:
-            return True, f"⚠️ Price stalled — exiting"
+        # Exit put when momentum reverses
+        if option_type == "put":
+            if move_1min > 0.5 and elapsed > 60:
+                return True, f"📈 Put momentum reversed — exit"
+            if move_1min > 0 and elapsed > 180:
+                return True, f"⚠️ Put stalling 3 min — exit"
 
         return False, ""
 

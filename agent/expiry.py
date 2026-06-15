@@ -1,5 +1,6 @@
 """
-expiry.py — Smart expiry picker
+expiry.py — 0DTE expiry picker
+Always picks today's expiry for same-day options
 """
 
 import robin_stocks.robinhood as rh
@@ -9,22 +10,26 @@ import pytz
 ET = pytz.timezone("America/New_York")
 
 
-def get_best_expiry(symbol: str, days_out: int = 5) -> str | None:
+def get_best_expiry(symbol: str, days_out: int = 0) -> str | None:
     try:
         chain = rh.options.get_chains(symbol)
         dates = chain.get("expiration_dates", [])
         if not dates:
             return None
+
         today = datetime.now(ET).date()
-        valid = [
+        today_str = today.strftime("%Y-%m-%d")
+
+        # Try today first (0DTE)
+        if today_str in dates:
+            return today_str
+
+        # If today not available (weekend/holiday) use nearest
+        future = [
             d for d in dates
-            if (datetime.strptime(d, "%Y-%m-%d").date() - today).days >= 2
+            if datetime.strptime(d, "%Y-%m-%d").date() >= today
         ]
-        if not valid:
-            return None
-        best = min(valid, key=lambda d: abs(
-            (datetime.strptime(d, "%Y-%m-%d").date() - today).days - days_out
-        ))
-        return best
+        return future[0] if future else None
+
     except Exception:
         return None
