@@ -1,7 +1,5 @@
 """
-main.py — Professional scalping agent with market sentiment
-Entry loop: every 30s + WebSocket real-time
-Exit loop: every 5s
+main.py — 0DTE Scalping Agent with day-of-week symbol selector
 """
 
 from dotenv import load_dotenv
@@ -28,7 +26,6 @@ from notifier  import (
     alert_daily_summary, alert_error, alert_daily_loss_limit
 )
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -40,16 +37,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SYMBOLS        = ["AAPL", "MCD"]
-SCAN_INTERVAL  = 30
-EXIT_INTERVAL  = 5
 DAILY_LOSS_CAP = float(os.environ.get("DAILY_LOSS_CAP", "200"))
 ET             = pytz.timezone("America/New_York")
+SCAN_INTERVAL  = 30
+EXIT_INTERVAL  = 5
 
 _open_scalp: dict | None = None
 daily_trades: list       = []
 last_summary_date: str   = ""
+
+
+def get_todays_symbols() -> list:
+    """
+    Return symbols based on day of week.
+    Only trade symbols that have 0DTE options today.
+    """
+    day = datetime.now(ET).weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+
+    if day == 0:    # Monday
+        symbols = ["SPY", "QQQ", "AAPL"]
+    elif day == 1:  # Tuesday
+        symbols = ["SPY", "QQQ"]
+    elif day == 2:  # Wednesday
+        symbols = ["SPY", "QQQ", "AAPL", "NVDA"]
+    elif day == 3:  # Thursday
+        symbols = ["SPY", "QQQ"]
+    elif day == 4:  # Friday
+        symbols = ["SPY", "QQQ", "AAPL", "NVDA", "MCD"]
+    else:
+        symbols = []
+
+    logger.info(f"Today's symbols ({['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][day]}): {symbols}")
+    return symbols
+
+
+def get_momentum_threshold(symbol: str) -> float:
+    """Different thresholds per symbol based on typical move size."""
+    thresholds = {
+        "SPY":  0.50,   # SPY moves $0.50 = significant
+        "QQQ":  0.75,   # QQQ slightly bigger moves
+        "AAPL": 1.00,   # Your proven threshold
+        "NVDA": 2.00,   # NVDA is more volatile
+        "MCD":  1.00,   # Similar to AAPL
+    }
+    return thresholds.get(symbol, 1.00)
 
 
 def monitor_exit():
@@ -104,7 +135,7 @@ def run_scan_cycle():
     global _open_scalp
 
     if daily_loss_limit_hit(DAILY_LOSS_CAP):
-        logger.warning(f"Daily loss cap ${DAILY_LOSS_CAP} hit — no new trades")
+        logger.warning(f"Daily loss cap hit — no new trades")
         return
 
     if _open_scalp:
@@ -115,57 +146,60 @@ def run_scan_cycle():
         logger.debug("Lunch hour — skipping")
         return
 
-    for symbol in SYMBOLS:
-        # ── Step 1: Market sentiment check ────────────────────────────────
+    # Don't open new 0DTE positions last 30 min
+    now_et = datetime.now(ET)
+    if now_et.hour == 15 and now_et.minute >= 30:
+        logger.debug("Last 30 min — no new 0DTE positions")
+        return
+
+    symbols = get_todays_symbols()
+
+    for symbol in symbols:
+        # Sentiment check
         sentiment = get_market_sentiment(symbol)
         if not sentiment["safe"]:
             logger.info(f"🚫 Sentiment block [{symbol}]: {sentiment['reason']}")
             continue
 
         spy_trend = sentiment["spy"]["trend"]
-        vix_level = sentiment["vix"]["level"]
-        logger.info(f"✅ Sentiment OK [{symbol}]: SPY={spy_trend} VIX={vix_level}")
+        logger.info(f"✅ Sentiment OK [{symbol}]: SPY={spy_trend} VIX={sentiment['vix']['level']}")
 
-        # ── Step 2: Technical signal ───────────────────────────────────────
-        signal = get_signal(symbol)
+        # Get signal with symbol-specific threshold
+        signal = get_signal(symbol, threshold=get_momentum_threshold(symbol))
         logger.info(f"Signal [{symbol}]: {signal.get('signal')} — {signal.get('reason')}")
 
         if signal.get("signal") not in ("BUY_CALL", "BUY_PUT"):
             continue
 
-        # ── Step 3: Align signal with market direction ─────────────────────
+        # Align with market direction
         option_type = "call" if signal["signal"] == "BUY_CALL" else "put"
-
-        # Don't buy calls in strong downtrend
         if option_type == "call" and spy_trend == "STRONG_DOWN":
-            logger.info(f"⚠️ Skipping CALL — market in STRONG_DOWN")
+            logger.info(f"⚠️ Skipping CALL — market STRONG_DOWN")
             continue
-
-        # Don't buy puts in strong uptrend
         if option_type == "put" and spy_trend == "STRONG_UP":
-            logger.info(f"⚠️ Skipping PUT — market in STRONG_UP")
+            logger.info(f"⚠️ Skipping PUT — market STRONG_UP")
             continue
 
-        # ── Step 4: Get expiry + strike ────────────────────────────────────
-        expiry = get_best_expiry(symbol, days_out=5)
+        # Get 0DTE expiry
+        expiry = get_best_expiry(symbol, days_out=0)
         if not expiry:
-            logger.warning(f"No expiry for {symbol}")
+            logger.warning(f"No 0DTE expiry for {symbol}")
             continue
 
+        # Get strike
         strike = find_otm_strike(symbol, option_type, expiry)
         if not strike:
             logger.warning(f"No strike for {symbol}")
             continue
 
-        # ── Step 5: Ask Claude with full context ───────────────────────────
+        # Ask Claude
         signal["sentiment"] = sentiment
         decision = decide(signal, _open_scalp)
-
         if decision.get("action") == "HOLD":
             logger.info(f"Claude HOLD — {decision.get('reason')}")
             continue
 
-        # ── Step 6: Place order ────────────────────────────────────────────
+        # Place order
         order = place_option_order(
             symbol=symbol,
             option_type=option_type,
@@ -187,7 +221,7 @@ def run_scan_cycle():
                 "pnl_pct":     0,
             }
             alert_trade_placed(decision, order)
-            logger.info(f"🎯 Scalp entered: {symbol} {option_type} ${strike} exp {expiry}")
+            logger.info(f"🎯 0DTE entered: {symbol} {option_type} ${strike} exp {expiry}")
             break
 
 
@@ -203,15 +237,15 @@ def maybe_send_daily_summary():
 
 
 def main():
-    logger.info("🤖 Scalping agent started")
-    logger.info(f"   Symbols:        {SYMBOLS}")
+    logger.info("🤖 0DTE Scalping Agent started")
     logger.info(f"   Daily loss cap: ${DAILY_LOSS_CAP}")
     logger.info(f"   Scan interval:  {SCAN_INTERVAL}s")
     logger.info(f"   Exit interval:  {EXIT_INTERVAL}s")
 
     login()
+    symbols = get_todays_symbols()
     set_scan_callback(run_scan_cycle)
-    start_stream()
+    start_stream(symbols)
 
     last_scan = 0
 

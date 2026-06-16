@@ -1,6 +1,6 @@
 """
 streamer.py — Real-time Alpaca WebSocket
-Triggers scan on EVERY 1-minute bar — true real-time
+Dynamically uses today's symbols from main.py
 """
 
 import os
@@ -13,9 +13,7 @@ from alpaca.data.live import StockDataStream
 logger = logging.getLogger(__name__)
 ET     = pytz.timezone("America/New_York")
 
-SYMBOLS        = ["AAPL", "MCD"]
 PRICE_MOVE_PCT = 0.15
-
 _last_prices   = {}
 _scan_callback = None
 
@@ -51,15 +49,16 @@ async def _on_bar(bar):
         logger.error(f"Streamer error: {e}")
 
 
-def start_stream():
+def start_stream(symbols: list):
+    """Start WebSocket stream for given symbols."""
     def run():
         try:
             stream = StockDataStream(
                 api_key=os.environ.get("ALPACA_API_KEY"),
                 secret_key=os.environ.get("ALPACA_SECRET_KEY"),
             )
-            stream.subscribe_bars(_on_bar, *SYMBOLS)
-            logger.info(f"⚡ WebSocket stream started for {SYMBOLS}")
+            stream.subscribe_bars(_on_bar, *symbols)
+            logger.info(f"⚡ WebSocket stream started for {symbols}")
             stream.run()
         except Exception as e:
             logger.error(f"Stream error: {e}")

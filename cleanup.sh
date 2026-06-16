@@ -24,3 +24,11 @@ sudo rm -rf /tmp/* 2>/dev/null
 df -h /
 
 echo "$(date) — Cleanup complete!"
+
+# Truncate syslog if over 500MB
+SYSLOG_SIZE=$(du -sm /var/log/syslog 2>/dev/null | cut -f1)
+if [ "${SYSLOG_SIZE:-0}" -gt 500 ]; then
+    echo "$(date) — Truncating syslog (${SYSLOG_SIZE}MB)"
+    sudo truncate -s 0 /var/log/syslog
+    sudo truncate -s 0 /var/log/syslog.1
+fi

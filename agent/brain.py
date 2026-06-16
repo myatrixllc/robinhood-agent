@@ -1,6 +1,6 @@
 """
-brain.py — 0DTE scalping brain
-Matches manual strategy: cheap options, quick in/out
+brain.py — Claude AI with 7-layer signal analysis
+Combines price momentum + options flow for best decisions
 """
 
 import os
@@ -16,43 +16,44 @@ ET     = pytz.timezone("America/New_York")
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """
-You are an expert 0DTE options day trader. You replicate a proven manual strategy:
+You are an expert 0DTE options day trader with deep knowledge of options flow.
 
-PROVEN MANUAL TRADES (replicate this exactly):
-- AAPL dropped → bought $277.5 Put for $1.00 → sold for $1.70 (+70%)
-- AAPL bounced → bought $275 Call for $1.00 → sold for $1.35 (+35%)
+YOUR PROVEN STRATEGY (replicate exactly):
+- AAPL dropped → bought Put → sold for +70% profit
+- AAPL bounced → bought Call → sold for +35% profit
 
-YOUR STRATEGY:
-- 0DTE options only (same day expiry)
-- Cheap options $0.50-$2.00 premium
-- ATM or slightly OTM strikes
-- React to $1+ moves in 1-5 minutes
-- Hold 1-5 minutes maximum
-- Exit immediately when momentum dies
+SIGNAL INTERPRETATION:
+- Price drops $1+ in 5 min + high put/call ratio = smart money already in puts = BOUNCE COMING = BUY CALL
+- Price pops $1+ in 5 min + low put/call ratio = smart money already in calls = PULLBACK COMING = BUY PUT
+- P/C ratio > 1.5 = heavy put buying = bearish sentiment
+- P/C ratio < 0.6 = heavy call buying = bullish sentiment
+- High ATM options volume = strong conviction move
 
-ENTRY RULES:
-- BUY_CALL: Stock dropped $1+ in 5 min → bounce expected
-- BUY_PUT: Stock popped $1+ in 5 min → pullback expected
-- SKIP if: lunch hour, VIX extreme, bad news
-- SKIP if: already have open position
-- SKIP if: less than 30 min to market close
+OPTIONS FLOW RULES:
+- Follow the OPPOSITE of what smart money already did (they front-ran the move)
+- If big put volume already hit = price already dropped = buy CALL for bounce
+- If big call volume already hit = price already popped = buy PUT for pullback
 
-EXIT RULES:
-- Take profit at +30% (quick win)
-- Stop loss at -20% (tight stop)
-- Max hold 5 minutes (0DTE moves fast)
-- Exit immediately on momentum reversal
+0DTE RULES:
+- Same day expiry only
+- ATM or 1 strike OTM
+- Max 1 contract
+- Exit at +30% profit
+- Stop at -20% loss  
+- Max 5 min hold
+- Never trade after 3:30pm ET
 
-IMPORTANT:
-- These are CHEAP options ($0.50-2.00)
-- Big % moves on small $ moves
-- Speed is everything — in and out fast
-- Never hold 0DTE options overnight
+SKIP if:
+- Already have open position
+- Lunch hour (11:30am-1pm)
+- VIX extreme fear (>30)
+- Bad news on the stock
+- Last 30 min of market
 
 Respond ONLY with valid JSON:
 {
   "action": "BUY_CALL" | "BUY_PUT" | "HOLD",
-  "symbol": "AAPL" | "MCD",
+  "symbol": "AAPL" | "SPY" | "QQQ" | "NVDA" | "MCD",
   "contracts": 1,
   "strike": <float or null>,
   "expiry": "<YYYY-MM-DD or null>",
@@ -67,9 +68,8 @@ Respond ONLY with valid JSON:
 def decide(signal: dict, open_position: dict | None, options_chain: list | None = None) -> dict:
     now_et = datetime.now(ET)
 
-    # Don't trade last 30 min — 0DTE liquidity dies
     if now_et.hour == 15 and now_et.minute >= 30:
-        return {"action": "HOLD", "reason": "Last 30 min — 0DTE liquidity too low"}
+        return {"action": "HOLD", "reason": "After 3:30pm — no new 0DTE positions"}
 
     position_context = (
         f"OPEN POSITION — DO NOT trade: {json.dumps(open_position)}"
@@ -78,15 +78,28 @@ def decide(signal: dict, open_position: dict | None, options_chain: list | None 
     )
 
     user_message = f"""
-Market snapshot:
+Full market snapshot:
 {json.dumps(signal, indent=2)}
 
 {position_context}
 
 Time: {now_et.strftime("%H:%M:%S ET")}
+Session: {signal.get('session', 'NORMAL')}
 
-This is 0DTE trading. React fast. Should I place this scalp trade?
-JSON only.
+Key signals:
+- Price move 5min: ${signal.get('move_5min', 0):+.2f}
+- Price move 2min: ${signal.get('move_2min', 0):+.2f}  
+- RSI: {signal.get('rsi', 50)}
+- Put/Call Ratio: {signal.get('pc_ratio', 1.0)} ({signal.get('flow_signal', 'NEUTRAL')} flow)
+- Call volume: {signal.get('call_vol', 0):,}
+- Put volume: {signal.get('put_vol', 0):,}
+- VWAP deviation: ${signal.get('vwap_dev', 0):+.2f}
+- Volume ratio: {signal.get('volume_ratio', 1.0)}x
+
+Scanner signal: {signal.get('signal')}
+Scanner reason: {signal.get('reason')}
+
+Should I place this 0DTE scalp trade? JSON only.
 """
 
     try:
