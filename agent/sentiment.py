@@ -51,7 +51,7 @@ def get_spy_trend() -> dict:
 
 def get_vix_level() -> dict:
     try:
-        bars = yf.Ticker("^VIX").history(period="1d", interval="1m")
+        bars = yf.Ticker("UVXY").history(period="1d", interval="1m")
         if bars.empty:
             return {"vix": None, "level": "UNKNOWN", "safe": True}
 

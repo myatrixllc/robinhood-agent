@@ -1,11 +1,12 @@
 """
 streamer.py — Real-time Alpaca WebSocket
-Dynamically uses today's symbols from main.py
+Uses a cooldown to prevent duplicate scan triggers
 """
 
 import os
 import logging
 import threading
+import time
 from datetime import datetime
 import pytz
 from alpaca.data.live import StockDataStream
@@ -16,6 +17,9 @@ ET     = pytz.timezone("America/New_York")
 PRICE_MOVE_PCT = 0.15
 _last_prices   = {}
 _scan_callback = None
+_last_scan_time = 0
+_scan_cooldown  = 30  # minimum 30 seconds between WebSocket triggered scans
+_scan_lock      = threading.Lock()
 
 
 def set_scan_callback(fn):
@@ -24,7 +28,7 @@ def set_scan_callback(fn):
 
 
 async def _on_bar(bar):
-    global _last_prices
+    global _last_prices, _last_scan_time
     try:
         symbol = bar.symbol
         price  = float(bar.close)
@@ -34,8 +38,15 @@ async def _on_bar(bar):
             return
 
         logger.info(f"📊 {symbol} bar: ${price}")
-        if _scan_callback:
-            threading.Thread(target=_scan_callback, daemon=True).start()
+
+        # Only trigger scan if cooldown has passed
+        now = time.time()
+        with _scan_lock:
+            if now - _last_scan_time < _scan_cooldown:
+                logger.debug(f"Scan cooldown active — skipping trigger")
+                _last_prices[symbol] = price
+                return
+            _last_scan_time = now
 
         if symbol in _last_prices:
             last = _last_prices[symbol]
@@ -45,12 +56,14 @@ async def _on_bar(bar):
 
         _last_prices[symbol] = price
 
+        if _scan_callback:
+            threading.Thread(target=_scan_callback, daemon=True).start()
+
     except Exception as e:
         logger.error(f"Streamer error: {e}")
 
 
 def start_stream(symbols: list):
-    """Start WebSocket stream for given symbols."""
     def run():
         try:
             stream = StockDataStream(

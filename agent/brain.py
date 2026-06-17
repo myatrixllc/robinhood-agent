@@ -1,6 +1,5 @@
 """
-brain.py — Claude AI with 7-layer signal analysis
-Combines price momentum + options flow for best decisions
+brain.py — Claude AI 0DTE scalping decisions
 """
 
 import os
@@ -16,39 +15,31 @@ ET     = pytz.timezone("America/New_York")
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """
-You are an expert 0DTE options day trader with deep knowledge of options flow.
+You are an expert 0DTE options day trader replicating a proven manual strategy:
 
-YOUR PROVEN STRATEGY (replicate exactly):
-- AAPL dropped → bought Put → sold for +70% profit
-- AAPL bounced → bought Call → sold for +35% profit
+PROVEN TRADES:
+- AAPL dropped → bought Put → sold for +70%
+- AAPL bounced → bought Call → sold for +35%
 
-SIGNAL INTERPRETATION:
-- Price drops $1+ in 5 min + high put/call ratio = smart money already in puts = BOUNCE COMING = BUY CALL
-- Price pops $1+ in 5 min + low put/call ratio = smart money already in calls = PULLBACK COMING = BUY PUT
-- P/C ratio > 1.5 = heavy put buying = bearish sentiment
-- P/C ratio < 0.6 = heavy call buying = bullish sentiment
-- High ATM options volume = strong conviction move
+STRATEGY:
+- 0DTE options only (same day expiry)
+- Max $1.50 premium per contract
+- ATM or 1 strike OTM only
+- React to $0.30-$1.00 moves in 5 minutes
+- Hold 1-5 minutes maximum
+- Exit immediately when momentum dies
 
-OPTIONS FLOW RULES:
-- Follow the OPPOSITE of what smart money already did (they front-ran the move)
-- If big put volume already hit = price already dropped = buy CALL for bounce
-- If big call volume already hit = price already popped = buy PUT for pullback
+ENTRY:
+- BUY_CALL: Price dropped fast → bounce expected
+- BUY_PUT:  Price popped fast → pullback expected
+- SKIP if: lunch hour, VIX extreme, bad news, open position
 
-0DTE RULES:
-- Same day expiry only
-- ATM or 1 strike OTM
-- Max 1 contract
-- Exit at +30% profit
-- Stop at -20% loss  
+EXIT:
+- Take profit at +30%
+- Stop loss at -20%
 - Max 5 min hold
-- Never trade after 3:30pm ET
 
-SKIP if:
-- Already have open position
-- Lunch hour (11:30am-1pm)
-- VIX extreme fear (>30)
-- Bad news on the stock
-- Last 30 min of market
+NEVER trade after 3:30pm ET.
 
 Respond ONLY with valid JSON:
 {
@@ -58,7 +49,7 @@ Respond ONLY with valid JSON:
   "strike": <float or null>,
   "expiry": "<YYYY-MM-DD or null>",
   "confidence": "HIGH" | "MEDIUM" | "LOW",
-  "reason": "<one sentence max>",
+  "reason": "<one sentence>",
   "exit_target_pct": 30,
   "stop_loss_pct": 20
 }
@@ -69,7 +60,7 @@ def decide(signal: dict, open_position: dict | None, options_chain: list | None 
     now_et = datetime.now(ET)
 
     if now_et.hour == 15 and now_et.minute >= 30:
-        return {"action": "HOLD", "reason": "After 3:30pm — no new 0DTE positions"}
+        return {"action": "HOLD", "reason": "After 3:30pm — no new 0DTE"}
 
     position_context = (
         f"OPEN POSITION — DO NOT trade: {json.dumps(open_position)}"
@@ -78,33 +69,19 @@ def decide(signal: dict, open_position: dict | None, options_chain: list | None 
     )
 
     user_message = f"""
-Full market snapshot:
+Market snapshot:
 {json.dumps(signal, indent=2)}
 
 {position_context}
 
 Time: {now_et.strftime("%H:%M:%S ET")}
-Session: {signal.get('session', 'NORMAL')}
 
-Key signals:
-- Price move 5min: ${signal.get('move_5min', 0):+.2f}
-- Price move 2min: ${signal.get('move_2min', 0):+.2f}  
-- RSI: {signal.get('rsi', 50)}
-- Put/Call Ratio: {signal.get('pc_ratio', 1.0)} ({signal.get('flow_signal', 'NEUTRAL')} flow)
-- Call volume: {signal.get('call_vol', 0):,}
-- Put volume: {signal.get('put_vol', 0):,}
-- VWAP deviation: ${signal.get('vwap_dev', 0):+.2f}
-- Volume ratio: {signal.get('volume_ratio', 1.0)}x
-
-Scanner signal: {signal.get('signal')}
-Scanner reason: {signal.get('reason')}
-
-Should I place this 0DTE scalp trade? JSON only.
+Should I scalp this? JSON only.
 """
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
