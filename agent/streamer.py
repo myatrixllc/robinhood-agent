@@ -66,9 +66,12 @@ async def _on_bar(bar):
 def start_stream(symbols: list):
     def run():
         try:
+            paper = os.environ.get("PAPER_TRADING", "false").lower() == "true"
+            api_key    = os.environ.get("ALPACA_PAPER_API_KEY") if paper else os.environ.get("ALPACA_API_KEY")
+            secret_key = os.environ.get("ALPACA_PAPER_SECRET_KEY") if paper else os.environ.get("ALPACA_SECRET_KEY")
             stream = StockDataStream(
-                api_key=os.environ.get("ALPACA_API_KEY"),
-                secret_key=os.environ.get("ALPACA_SECRET_KEY"),
+                api_key=api_key,
+                secret_key=secret_key,
             )
             stream.subscribe_bars(_on_bar, *symbols)
             logger.info(f"⚡ WebSocket stream started for {symbols}")
