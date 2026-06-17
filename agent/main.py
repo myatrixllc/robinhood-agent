@@ -17,12 +17,22 @@ import pytz
 from scanner   import get_signal, is_market_open, should_exit_position, get_time_session
 from brain     import decide, should_exit
 from sentiment import get_market_sentiment
-from executor  import (
-    login, get_option_positions, has_open_position,
-    place_option_order, close_option_position,
-    enrich_position_pnl, daily_loss_limit_hit,
-    record_loss, find_otm_strike
-)
+import os as _os
+if _os.environ.get("PAPER_TRADING", "false").lower() == "true":
+    from executor_alpaca import (
+        get_option_positions, has_open_position,
+        place_option_order, close_option_position,
+        enrich_position_pnl, daily_loss_limit_hit,
+        record_loss, find_otm_strike
+    )
+    def login(): pass  # Alpaca uses API keys, no login needed
+else:
+    from executor import (
+        login, get_option_positions, has_open_position,
+        place_option_order, close_option_position,
+        enrich_position_pnl, daily_loss_limit_hit,
+        record_loss, find_otm_strike
+    )
 from expiry    import get_best_expiry
 from streamer  import start_stream, set_scan_callback
 from notifier  import (
