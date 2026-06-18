@@ -61,8 +61,10 @@ SCAN_INTERVAL  = 30
 EXIT_INTERVAL  = 10
 
 # ── State ─────────────────────────────────────────────────────────────────────
-_open_scalp:  dict | None = None
-_trade_lock   = threading.Lock()
+_open_scalp:    dict | None = None
+_trade_lock     = threading.Lock()
+_placing_order  = False  # Hard flag to prevent duplicates
+_last_order_time = 0     # Timestamp of last order placed
 daily_trades: list        = []
 last_summary_date: str    = ""
 
@@ -180,11 +182,22 @@ def _close_all(reason: str):
 def run_scan_cycle():
     global _open_scalp
 
+    global _last_order_time, _placing_order, _open_scalp
+
     if not _trade_lock.acquire(blocking=False):
         logger.debug("Trade lock busy")
         return
 
     try:
+        # Hard cooldown — 60 seconds after any order
+        if time.time() - _last_order_time < 60:
+            logger.debug("⛔ Order cooldown active — skipping")
+            return
+
+        if _placing_order:
+            logger.info("⛔ Order being placed — skipping")
+            return
+
         if has_open_position():
             logger.info("⛔ Open position exists — skipping scan")
             return
@@ -228,6 +241,7 @@ def run_scan_cycle():
 
             expiry = get_best_expiry(symbol, days_out=0)
             if not expiry:
+                logger.warning(f"No 0DTE expiry for {symbol} — skipping")
                 continue
 
             strike = find_otm_strike(symbol, option_type, expiry)
@@ -247,6 +261,8 @@ def run_scan_cycle():
 
             if has_open_position():
                 return
+
+            _placing_order = True
 
             order = place_option_order(
                 symbol=symbol,
@@ -269,10 +285,12 @@ def run_scan_cycle():
                     "elapsed_seconds": 0,
                 }
                 alert_trade_placed(decision, order)
+                _last_order_time = time.time()
                 logger.info(f"🎯 0DTE: {symbol} {option_type} ${strike} {expiry}")
                 break
 
     finally:
+        _placing_order = False
         _trade_lock.release()
 
 

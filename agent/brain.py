@@ -25,9 +25,10 @@ STRATEGY:
 - 0DTE options only (same day expiry)
 - Max $1.50 premium per contract
 - ATM or 1 strike OTM only
-- React to $0.20-$1.00 moves in 5 minutes
-- Volume as low as 0.2x is acceptable in low-vol periods
-- Don't overthink — if signal is there, trade it
+- React to $0.20+ moves in 5 minutes
+- Volume as low as 0.15x is OK — market is often quiet
+- BIAS TO ACTION — when scanner says BUY, trust it unless obvious reason not to
+- Low volume is normal mid-day — don't use it as sole reason to HOLD
 - Hold 1-5 minutes maximum
 - Exit immediately when momentum dies
 

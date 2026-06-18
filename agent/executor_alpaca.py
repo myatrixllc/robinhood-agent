@@ -13,7 +13,15 @@ import pytz
 logger = logging.getLogger(__name__)
 ET     = pytz.timezone("America/New_York")
 
-MAX_OPTION_PRICE = 1.50
+# Per-symbol max price
+MAX_PRICES = {
+    "SPY":  3.00,
+    "QQQ":  3.00,
+    "AAPL": 2.00,
+    "NVDA": 2.00,
+    "MCD":  1.50,
+}
+MAX_OPTION_PRICE = 3.00  # global fallback
 PAPER_TRADING    = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 # Remove /v2 from URL if present — added in _get/_post
 _raw_url = os.environ.get("ALPACA_PAPER_BASE_URL", "https://paper-api.alpaca.markets/v2")
@@ -169,13 +177,21 @@ def close_option_position(position: dict) -> dict:
 
 def enrich_position_pnl(position: dict) -> dict:
     try:
-        unrealized = float(position.get("unrealized_pl", 0) or 0)
-        cost       = float(position.get("cost_basis", 0) or 0)
-        pnl_pct    = (unrealized / cost * 100) if cost > 0 else 0
-        position["pnl_pct"]       = round(pnl_pct, 2)
+        # Use unrealized_plpc (percentage) directly from Alpaca
+        plpc = float(position.get("unrealized_plpc", 0) or 0)
+        pnl_pct = round(plpc * 100, 2)
+
+        # Fallback to manual calc
+        if pnl_pct == 0:
+            unrealized = float(position.get("unrealized_pl", 0) or 0)
+            cost       = float(position.get("cost_basis", 0) or 0)
+            if cost > 0:
+                pnl_pct = round((unrealized / cost) * 100, 2)
+
+        position["pnl_pct"]       = pnl_pct
         position["current_price"] = float(position.get("current_price", 0) or 0)
         position["entry_price"]   = float(position.get("avg_entry_price", 0) or 0)
-        logger.info(f"P&L: ${unrealized:.2f} ({pnl_pct:+.1f}%)")
+        logger.info(f"P&L: {pnl_pct:+.1f}% (current=${position['current_price']})")
     except Exception as e:
         logger.warning(f"P&L error: {e}")
         position["pnl_pct"] = 0
