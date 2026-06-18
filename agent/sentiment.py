@@ -79,8 +79,12 @@ def get_vix_level() -> dict:
 
 def get_news_sentiment(symbol: str) -> dict:
     try:
-        api_key    = os.environ.get("ALPACA_API_KEY")
-        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+        # Skip news API — requires paid subscription
+        return {"sentiment": "NEUTRAL", "safe": True, "headlines": []}
+        
+        # News API requires live keys
+        api_key    = os.environ.get("ALPACA_API_KEY") or os.environ.get("ALPACA_PAPER_API_KEY")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_PAPER_SECRET_KEY")
         url        = "https://data.alpaca.markets/v1beta1/news"
         params     = {"symbols": symbol, "limit": 5, "sort": "desc"}
         headers    = {

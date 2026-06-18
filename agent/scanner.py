@@ -29,7 +29,7 @@ def get_time_session() -> str:
     now = datetime.now(ET).time()
     if time(9, 35) <= now <= time(10, 30):
         return "PRIME"
-    elif time(11, 30) <= now <= time(13, 0):
+    elif time(12, 0) <= now <= time(12, 30):
         return "LUNCH"
     elif time(13, 0) <= now <= time(15, 45):
         return "AFTERNOON"

@@ -1,6 +1,6 @@
 """
-main.py — Stable 0DTE scalping agent v2
-Fixes: duplicate orders, exit monitor, log cleanup, max price $1.50
+main.py — Stable 0DTE scalping agent v3
+Clean rewrite with working exit monitor
 """
 
 from dotenv import load_dotenv
@@ -17,6 +17,7 @@ import pytz
 from scanner   import get_signal, is_market_open, should_exit_position, get_time_session
 from brain     import decide, should_exit
 from sentiment import get_market_sentiment
+
 import os as _os
 if _os.environ.get("PAPER_TRADING", "false").lower() == "true":
     from executor_alpaca import (
@@ -25,7 +26,7 @@ if _os.environ.get("PAPER_TRADING", "false").lower() == "true":
         enrich_position_pnl, daily_loss_limit_hit,
         record_loss, find_otm_strike
     )
-    def login(): pass  # Alpaca uses API keys, no login needed
+    def login(): pass
 else:
     from executor import (
         login, get_option_positions, has_open_position,
@@ -33,6 +34,7 @@ else:
         enrich_position_pnl, daily_loss_limit_hit,
         record_loss, find_otm_strike
     )
+
 from expiry    import get_best_expiry
 from streamer  import start_stream, set_scan_callback
 from notifier  import (
@@ -72,7 +74,7 @@ def get_todays_symbols() -> list:
         0: ["SPY", "QQQ", "AAPL"],
         1: ["SPY", "QQQ"],
         2: ["SPY", "QQQ", "AAPL", "NVDA"],
-        3: ["SPY", "QQQ"],
+        3: ["SPY", "QQQ", "AAPL"],
         4: ["SPY", "QQQ", "AAPL", "NVDA"],
     }
     result = symbols.get(day, [])
@@ -84,7 +86,7 @@ def get_momentum_threshold(symbol: str) -> float:
     return {
         "SPY":  0.30,
         "QQQ":  0.50,
-        "AAPL": 0.75,
+        "AAPL": 0.50,
         "NVDA": 1.50,
         "MCD":  1.00,
     }.get(symbol, 1.00)
@@ -92,75 +94,86 @@ def get_momentum_threshold(symbol: str) -> float:
 
 # ── Exit monitor ──────────────────────────────────────────────────────────────
 def monitor_exit():
+    """Check ALL open positions every EXIT_INTERVAL seconds."""
     global _open_scalp
 
-    if not _open_scalp:
+    positions = get_option_positions()
+
+    if not positions:
+        if _open_scalp:
+            logger.info("No open positions — clearing state")
+            _open_scalp = None
         return
 
-    try:
-        symbol      = _open_scalp.get("symbol")
-        option_type = _open_scalp.get("option_type")
-        entry_time  = _open_scalp.get("entry_time")
+    # Work with first position
+    pos     = positions[0]
+    pos_sym = pos.get("symbol", "")
 
-        if not entry_time:
-            return
+    # Set _open_scalp if missing
+    if not _open_scalp:
+        otype = "put" if "P" in pos_sym[6:] else "call"
+        _open_scalp = {
+            "symbol":          pos_sym,
+            "option_type":     otype,
+            "entry_time":      datetime.now(ET),
+            "entry_price":     0,
+            "pnl_pct":         0,
+            "elapsed_seconds": 0,
+        }
+        logger.info(f"🔄 Tracking: {pos_sym}")
 
-        elapsed = (datetime.now(ET) - entry_time).seconds
-        _open_scalp["elapsed_seconds"] = elapsed
+    # Enrich P&L
+    pos     = enrich_position_pnl(pos)
+    pnl     = pos.get("pnl_pct", 0)
+    elapsed = (datetime.now(ET) - _open_scalp.get("entry_time", datetime.now(ET))).seconds
 
-        positions = get_option_positions()
-        matching  = [p for p in positions if p.get("chain_symbol") == symbol]
+    _open_scalp["pnl_pct"]         = pnl
+    _open_scalp["elapsed_seconds"] = elapsed
 
-        if not matching:
-            logger.info(f"Position {symbol} no longer open — clearing")
-            _open_scalp = None
-            return
+    logger.info(f"👁 Monitor [{pos_sym}]: P&L={pnl:+.1f}% elapsed={elapsed}s")
 
-        pos = enrich_position_pnl(matching[0])
-        pnl = pos.get("pnl_pct", 0)
-        _open_scalp["pnl_pct"] = pnl
+    # P&L exit
+    exit_now, reason = should_exit(_open_scalp)
+    if exit_now:
+        _close_all(reason)
+        return
 
-        logger.info(f"👁 Monitor [{symbol}]: P&L={pnl:+.1f}% elapsed={elapsed}s")
-
-        # P&L exit
-        exit_now, reason = should_exit(_open_scalp)
-        if exit_now:
-            _close_position(pos, reason)
-            return
-
-        # Momentum exit
-        exit_now, reason = should_exit_position(
-            symbol, _open_scalp.get("entry_price", 0),
-            entry_time, option_type
-        )
-        if exit_now:
-            _close_position(pos, reason)
-
-    except Exception as e:
-        logger.error(f"Monitor exit error: {e}")
+    # Momentum exit
+    underlying = next((s for s in ["SPY","QQQ","AAPL","NVDA","MCD"] if s in pos_sym), pos_sym[:4])
+    exit_now, reason = should_exit_position(
+        underlying, _open_scalp.get("entry_price", 0),
+        _open_scalp.get("entry_time", datetime.now(ET)),
+        _open_scalp.get("option_type", "call")
+    )
+    if exit_now:
+        _close_all(reason)
 
 
-def _close_position(pos: dict, reason: str):
+def _close_all(reason: str):
+    """Close ALL open positions."""
     global _open_scalp
     try:
-        result = close_option_position(pos)
-        if "error" not in result:
+        positions = get_option_positions()
+        for pos in positions:
+            pos = enrich_position_pnl(pos)
+            result = close_option_position(pos)
             pnl = pos.get("pnl_pct", 0)
-            if pnl < 0:
-                record_loss(abs(pnl))
-            alert_position_closed(pos, reason)
-            daily_trades.append({
-                "symbol":      pos.get("chain_symbol"),
-                "option_type": pos.get("option_type"),
-                "pnl_pct":     pnl,
-                "exit_reason": reason,
-            })
-            logger.info(f"✅ Closed: {reason} | P&L: {pnl:+.1f}%")
-            _open_scalp = None
-        else:
-            logger.error(f"Close failed: {result}")
+            if "error" not in result:
+                if pnl < 0:
+                    record_loss(abs(pnl))
+                alert_position_closed(pos, reason)
+                daily_trades.append({
+                    "symbol":      pos.get("symbol"),
+                    "option_type": _open_scalp.get("option_type", "") if _open_scalp else "",
+                    "pnl_pct":     pnl,
+                    "exit_reason": reason,
+                })
+                logger.info(f"✅ Closed: {reason} | P&L: {pnl:+.1f}%")
+            else:
+                logger.error(f"Close failed: {result}")
+        _open_scalp = None
     except Exception as e:
-        logger.error(f"Close position error: {e}")
+        logger.error(f"Close all error: {e}")
 
 
 # ── Entry scanner ─────────────────────────────────────────────────────────────
@@ -168,7 +181,7 @@ def run_scan_cycle():
     global _open_scalp
 
     if not _trade_lock.acquire(blocking=False):
-        logger.debug("Trade lock busy — skipping")
+        logger.debug("Trade lock busy")
         return
 
     try:
@@ -180,17 +193,15 @@ def run_scan_cycle():
             return
 
         if daily_loss_limit_hit(DAILY_LOSS_CAP):
-            logger.warning("Daily loss cap hit — no new trades")
+            logger.warning("Daily loss cap hit")
             return
 
         session = get_time_session()
         if session == "LUNCH":
-            logger.debug("Lunch hour — skipping")
             return
 
         now_et = datetime.now(ET)
         if now_et.hour == 15 and now_et.minute >= 30:
-            logger.debug("After 3:30pm — no new 0DTE")
             return
 
         for symbol in get_todays_symbols():
@@ -211,37 +222,30 @@ def run_scan_cycle():
             option_type = "call" if signal["signal"] == "BUY_CALL" else "put"
 
             if option_type == "call" and spy_trend == "STRONG_DOWN":
-                logger.info(f"⚠️ Skipping CALL — market STRONG_DOWN")
                 continue
             if option_type == "put" and spy_trend == "STRONG_UP":
-                logger.info(f"⚠️ Skipping PUT — market STRONG_UP")
                 continue
 
             expiry = get_best_expiry(symbol, days_out=0)
             if not expiry:
-                logger.warning(f"No 0DTE expiry for {symbol}")
                 continue
 
             strike = find_otm_strike(symbol, option_type, expiry)
             if not strike:
-                logger.warning(f"No affordable strike for {symbol} — skipping")
+                logger.warning(f"No affordable strike for {symbol}")
                 continue
 
-            # Clean signal for Claude
             signal_clean = {k: v for k, v in signal.items()
                           if not hasattr(v, "strftime") and k != "sentiment"}
-            signal_clean["sentiment_spy"]  = sentiment["spy"]["trend"]
-            signal_clean["sentiment_vix"]  = sentiment["vix"]["level"]
-            signal_clean["sentiment_news"] = sentiment["news"]["sentiment"]
+            signal_clean["sentiment_spy"] = sentiment["spy"]["trend"]
+            signal_clean["sentiment_vix"] = sentiment["vix"]["level"]
 
             decision = decide(signal_clean, None)
             if decision.get("action") == "HOLD":
                 logger.info(f"Claude HOLD — {decision.get('reason')}")
                 continue
 
-            # Final live check
             if has_open_position():
-                logger.info("⛔ Position opened by another thread — aborting")
                 return
 
             order = place_option_order(
@@ -259,22 +263,20 @@ def run_scan_cycle():
                 _open_scalp = {
                     "symbol":          symbol,
                     "option_type":     option_type,
-                    "strike":          strike,
-                    "expiry":          expiry,
                     "entry_time":      datetime.now(ET),
                     "entry_price":     signal.get("price"),
                     "pnl_pct":         0,
                     "elapsed_seconds": 0,
                 }
                 alert_trade_placed(decision, order)
-                logger.info(f"🎯 0DTE entered: {symbol} {option_type} ${strike} exp {expiry}")
+                logger.info(f"🎯 0DTE: {symbol} {option_type} ${strike} {expiry}")
                 break
 
     finally:
         _trade_lock.release()
 
 
-# ── Background cleanup ────────────────────────────────────────────────────────
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 def cleanup_logs():
     while True:
         try:
@@ -319,16 +321,16 @@ def maybe_send_daily_summary():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    logger.info("🤖 0DTE Scalping Agent v2 started")
+    logger.info("🤖 0DTE Scalping Agent v3 started")
     logger.info(f"   Daily loss cap:   ${DAILY_LOSS_CAP}")
     logger.info(f"   Max option price: $1.50")
     logger.info(f"   Scan interval:    {SCAN_INTERVAL}s")
     logger.info(f"   Exit interval:    {EXIT_INTERVAL}s")
+    logger.info(f"   Paper trading:    {_os.environ.get('PAPER_TRADING', 'false')}")
 
     login()
 
     threading.Thread(target=cleanup_logs, daemon=True).start()
-    logger.info("🧹 Background cleanup started")
 
     symbols = get_todays_symbols()
     set_scan_callback(run_scan_cycle)
