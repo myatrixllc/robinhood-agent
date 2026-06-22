@@ -65,7 +65,12 @@ ORDER_COOLDOWN   = 60
 _open_scalp:     dict | None = None
 _trade_lock      = threading.Lock()
 _placing_order   = False
-_last_order_time = 0.0
+# Load last order time from file to persist across restarts
+try:
+    with open("/tmp/last_order_time.txt", "r") as f:
+        _last_order_time = float(f.read().strip())
+except Exception:
+    _last_order_time = 0.0
 daily_trades:    list = []
 last_summary_date: str = ""
 
@@ -284,6 +289,9 @@ def run_scan_cycle():
                 contracts=1,
             )
             _last_order_time = time.time()
+            # Persist cooldown across restarts
+            with open("/tmp/last_order_time.txt", "w") as f:
+                f.write(str(_last_order_time))
 
             if "error" in order:
                 logger.warning(f"Order rejected: {order['error']}")

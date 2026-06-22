@@ -53,7 +53,7 @@ The core idea: stocks move too far too fast → they snap back.
 
 ## DECISION RULES
 - Score >= 4: BUY (HIGH confidence)
-- Score 3: BUY (MEDIUM confidence) — only if move size scores
+- Score >= 4: BUY (HIGH confidence only) — MEDIUM and LOW always HOLD
 - Score < 3: HOLD
 
 ## ABSOLUTE HARD RULES (never break these)
@@ -137,7 +137,7 @@ Respond with JSON only.
         if decision.get("confidence") == "LOW":
             decision["action"] = "HOLD"
 
-        if decision.get("score", 0) < 3:
+        if decision.get("score", 0) < 4:
             decision["action"] = "HOLD"
 
         logger.info(
