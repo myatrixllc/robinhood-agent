@@ -14,13 +14,13 @@ ET     = pytz.timezone("America/New_York")
 
 # ── Per-symbol max option price ───────────────────────────────────────────────
 MAX_PRICES = {
-    "SPY":  1.50,
-    "QQQ":  1.50,
-    "AAPL": 1.50,
-    "NVDA": 1.50,
+    "SPY":  3.00,
+    "QQQ":  3.00,
+    "AAPL": 2.00,
+    "NVDA": 2.00,
     "MCD":  1.50,
 }
-DEFAULT_MAX_PRICE = 1.50
+DEFAULT_MAX_PRICE = 3.00
 
 # ── API Config ────────────────────────────────────────────────────────────────
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
